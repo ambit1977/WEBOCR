@@ -19,6 +19,8 @@ let currentImage = null;
 
 function setStatus(msg) { if (statusEl) statusEl.textContent = msg; }
 
+function yieldToUI() { return new Promise(r => setTimeout(r, 0)); }
+
 function showError(err) {
   console.error(err);
   if (errorEl && errorLog) {
@@ -31,16 +33,29 @@ function showError(err) {
   if (retryBtn) retryBtn.style.display = 'inline-block';
 }
 
-function waitForOpenCV(timeoutMs = 20000) {
+function waitForOpenCV(timeoutMs = 30000) {
   return new Promise((resolve, reject) => {
     const start = Date.now();
     const check = () => {
       if (window.cv && window.cv.Mat) return resolve(window.cv);
-      if (Date.now() - start > timeoutMs) return reject(new Error('OpenCV.js の読み込みタイムアウト'));
-      setTimeout(check, 100);
+      if (Date.now() - start > timeoutMs) return reject(new Error('OpenCV.js 読み込みタイムアウト'));
+      setTimeout(check, 200);
     };
     check();
   });
+}
+
+// ---- resize large image to max dimension (avoid freezing) ----
+function resizeCanvas(src, maxPx = 1600) {
+  const { width: w, height: h } = src;
+  if (w <= maxPx && h <= maxPx) return src;
+  const scale = maxPx / Math.max(w, h);
+  const out = document.createElement('canvas');
+  out.width  = Math.round(w * scale);
+  out.height = Math.round(h * scale);
+  const ctx = out.getContext('2d');
+  ctx.drawImage(src, 0, 0, out.width, out.height);
+  return out;
 }
 
 // ---- file input ----
@@ -61,61 +76,47 @@ fileInput.addEventListener('change', (e) => {
   };
 });
 
-// ---- OpenCV pipeline (number mode) ----
-
-/**
- * Returns array of {x, y, w, h} bounding boxes likely containing digit groups.
- * Also draws overlay canvas with red boxes.
- */
+// ---- OpenCV: detect number regions ----
 function detectNumberRegions(cv, imgCanvas) {
-  const src = cv.imread(imgCanvas);
-  const gray = new cv.Mat();
-  const blurred = new cv.Mat();
-  const thresh = new cv.Mat();
-  const dilated = new cv.Mat();
-  const contours = new cv.MatVector();
+  const src       = cv.imread(imgCanvas);
+  const gray      = new cv.Mat();
+  const blurred   = new cv.Mat();
+  const thresh    = new cv.Mat();
+  const dilated   = new cv.Mat();
+  const contours  = new cv.MatVector();
   const hierarchy = new cv.Mat();
 
   try {
     cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
     cv.GaussianBlur(gray, blurred, new cv.Size(5, 5), 0);
+    cv.adaptiveThreshold(blurred, thresh, 255,
+      cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 15, 8);
 
-    // Adaptive threshold — handles uneven lighting / shadows
-    cv.adaptiveThreshold(
-      blurred, thresh, 255,
-      cv.ADAPTIVE_THRESH_GAUSSIAN_C,
-      cv.THRESH_BINARY_INV,
-      15, 8
-    );
-
-    // Dilate to connect nearby digit strokes
-    const kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(12, 6));
+    const kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(14, 8));
     cv.dilate(thresh, dilated, kernel);
     kernel.delete();
 
-    cv.findContours(dilated, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+    cv.findContours(dilated, contours, hierarchy,
+      cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
 
-    const W = imgCanvas.width;
-    const H = imgCanvas.height;
-    const minArea = W * H * 0.0005;
-    const maxArea = W * H * 0.5;
-
+    const W = imgCanvas.width, H = imgCanvas.height;
+    const minArea = W * H * 0.0003;
+    const maxArea = W * H * 0.6;
     const boxes = [];
+
     for (let i = 0; i < contours.size(); i++) {
-      const rect = cv.boundingRect(contours.get(i));
-      const area = rect.width * rect.height;
-      const aspect = rect.width / rect.height;
-      // filter: reasonable size and aspect ratio for digit groups
+      const r = cv.boundingRect(contours.get(i));
+      const area = r.width * r.height;
+      const asp  = r.width / r.height;
       if (area < minArea || area > maxArea) continue;
-      if (aspect < 0.2 || aspect > 15) continue;
-      if (rect.height < 10 || rect.width < 8) continue;
-      boxes.push({ x: rect.x, y: rect.y, w: rect.width, h: rect.height });
+      if (asp < 0.15 || asp > 20) continue;
+      if (r.height < 8 || r.width < 6) continue;
+      boxes.push({ x: r.x, y: r.y, w: r.width, h: r.height });
     }
 
-    // Draw overlay
+    // draw overlay
     overlay.width  = W;
     overlay.height = H;
-    // match display size of preview
     overlay.style.width  = previewImg.offsetWidth  + 'px';
     overlay.style.height = previewImg.offsetHeight + 'px';
     overlay.style.display = 'block';
@@ -123,12 +124,12 @@ function detectNumberRegions(cv, imgCanvas) {
     const octx = overlay.getContext('2d');
     octx.clearRect(0, 0, W, H);
     octx.strokeStyle = '#e00';
-    octx.lineWidth = Math.max(2, Math.round(W / 400));
-    octx.font = `bold ${Math.max(12, Math.round(W / 60))}px monospace`;
+    octx.lineWidth = Math.max(2, Math.round(W / 500));
+    octx.font = `bold ${Math.max(12, Math.round(W / 70))}px monospace`;
     octx.fillStyle = '#e00';
     boxes.forEach((b, idx) => {
       octx.strokeRect(b.x, b.y, b.w, b.h);
-      octx.fillText(idx + 1, b.x + 2, b.y + Math.max(14, Math.round(W / 50)));
+      octx.fillText(idx + 1, b.x + 2, b.y + Math.max(14, Math.round(W / 60)));
     });
 
     return boxes;
@@ -139,17 +140,13 @@ function detectNumberRegions(cv, imgCanvas) {
   }
 }
 
-/**
- * Crop a region from canvas, upscale, sharpen and return as a new canvas.
- */
-function cropAndEnhance(srcCanvas, box, scale = 3) {
-  const { x, y, w, h } = box;
-  // add padding
-  const pad = Math.round(Math.min(w, h) * 0.15);
-  const sx = Math.max(0, x - pad);
-  const sy = Math.max(0, y - pad);
-  const sw = Math.min(srcCanvas.width  - sx, w + pad * 2);
-  const sh = Math.min(srcCanvas.height - sy, h + pad * 2);
+// ---- crop + enhance a single region ----
+function cropAndEnhance(srcCanvas, box, scale = 2) {
+  const pad = Math.round(Math.min(box.w, box.h) * 0.15);
+  const sx = Math.max(0, box.x - pad);
+  const sy = Math.max(0, box.y - pad);
+  const sw = Math.min(srcCanvas.width  - sx, box.w + pad * 2);
+  const sh = Math.min(srcCanvas.height - sy, box.h + pad * 2);
 
   const out = document.createElement('canvas');
   out.width  = sw * scale;
@@ -159,46 +156,55 @@ function cropAndEnhance(srcCanvas, box, scale = 3) {
   ctx.imageSmoothingQuality = 'high';
   ctx.drawImage(srcCanvas, sx, sy, sw, sh, 0, 0, out.width, out.height);
 
-  // grayscale + contrast + binarize
+  // binarize
   const id = ctx.getImageData(0, 0, out.width, out.height);
-  const d = id.data;
+  const d  = id.data;
   for (let i = 0; i < d.length; i += 4) {
     let v = 0.299 * d[i] + 0.587 * d[i+1] + 0.114 * d[i+2];
     v = Math.min(255, Math.max(0, (v - 128) * 2.0 + 128));
-    v = v > 128 ? 255 : 0;
-    d[i] = d[i+1] = d[i+2] = v;
+    d[i] = d[i+1] = d[i+2] = (v > 128 ? 255 : 0);
   }
   ctx.putImageData(id, 0, 0);
   return out;
 }
 
-// ---- Tesseract helpers ----
+// ---- Tesseract worker (reused across regions) ----
+let sharedWorker = null;
 
-async function runTesseract(srcCanvas, lang, numOnly, logger) {
-  const params = numOnly ? { tessedit_char_whitelist: '0123456789', tessedit_pageseg_mode: '6' } : {};
+async function getWorker(lang, numOnly) {
+  // If language changed or no worker yet, create one
+  const key = lang + (numOnly ? '_num' : '');
+  if (sharedWorker && sharedWorker._key === key) return sharedWorker;
+  if (sharedWorker) {
+    try { await sharedWorker.terminate(); } catch(e) {}
+    sharedWorker = null;
+  }
 
   if (typeof Tesseract === 'undefined') throw new Error('Tesseract.js が読み込まれていません');
+  const worker = Tesseract.createWorker({});
 
-  let text;
-  if (typeof Tesseract.createWorker === 'function') {
-    const worker = Tesseract.createWorker({ logger });
-    if (typeof worker.load === 'function') {
-      await worker.load();
-      await worker.loadLanguage(lang);
-      await worker.initialize(lang);
-      if (numOnly) await worker.setParameters(params);
-      ({ data: { text } } = await worker.recognize(srcCanvas));
-      await worker.terminate();
-    } else {
-      ({ data: { text } } = await Tesseract.recognize(srcCanvas, lang, { logger, ...params }));
-    }
-  } else {
-    ({ data: { text } } = await Tesseract.recognize(srcCanvas, lang, { logger, ...params }));
+  if (typeof worker.load === 'function') {
+    setStatus('Tesseract モデル読み込み中...');
+    await worker.load();
+    await worker.loadLanguage(lang);
+    await worker.initialize(lang);
+    if (numOnly) await worker.setParameters({
+      tessedit_char_whitelist: '0123456789',
+      tessedit_pageseg_mode: '7',  // single line
+    });
   }
+
+  worker._key = key;
+  sharedWorker = worker;
+  return worker;
+}
+
+async function ocrCanvas(worker, cvs) {
+  const { data: { text } } = await worker.recognize(cvs);
   return text;
 }
 
-// ---- main recognize flow ----
+// ---- main recognize ----
 
 recognizeBtn.addEventListener('click', async () => {
   if (!currentImage) return;
@@ -209,31 +215,30 @@ recognizeBtn.addEventListener('click', async () => {
   regionsList.innerHTML = '';
 
   const numOnly = numOnlyCheck && numOnlyCheck.checked;
-
-  // draw image to canvas
-  canvas.width  = currentImage.naturalWidth;
-  canvas.height = currentImage.naturalHeight;
-  const ctx = canvas.getContext('2d');
-  ctx.drawImage(currentImage, 0, 0);
-
-  const lang = numOnly ? 'eng' : (langSelect.value || 'eng');
-
-  const logger = m => {
-    if (m.status === 'recognizing text' || m.status === 'loading tesseract core') {
-      setStatus(`${m.status} — ${(m.progress * 100).toFixed(1)}%`);
-    } else if (m.status) {
-      setStatus(m.status);
-    }
-  };
+  const lang    = numOnly ? 'eng' : (langSelect.value || 'eng');
 
   try {
+    setStatus('画像準備中...');
+    await yieldToUI();
+
+    // draw + resize
+    canvas.width  = currentImage.naturalWidth;
+    canvas.height = currentImage.naturalHeight;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(currentImage, 0, 0);
+    await yieldToUI();
+
+    const workCanvas = resizeCanvas(canvas);
+
     if (numOnly) {
-      // --- OpenCV path ---
-      setStatus('OpenCV.js を待機中...');
+      setStatus('OpenCV.js 待機中...');
+      await yieldToUI();
       const cv = await waitForOpenCV();
 
       setStatus('数字領域を検出中...');
-      const boxes = detectNumberRegions(cv, canvas);
+      await yieldToUI();
+      const boxes = detectNumberRegions(cv, workCanvas);
+      await yieldToUI();
 
       if (boxes.length === 0) {
         resultText.value = '（数字領域が検出されませんでした）';
@@ -242,21 +247,26 @@ recognizeBtn.addEventListener('click', async () => {
         return;
       }
 
-      setStatus(`${boxes.length} 領域を検出。OCR実行中...`);
+      // Cap at 20 regions
+      const limited = boxes.slice(0, 20);
+      setStatus(`${limited.length} 領域検出。Tesseract準備中...`);
+      await yieldToUI();
+
+      const worker = await getWorker(lang, true);
       const results = [];
-      for (let i = 0; i < boxes.length; i++) {
-        setStatus(`OCR中... 領域 ${i + 1} / ${boxes.length}`);
-        const cropped = cropAndEnhance(canvas, boxes[i]);
-        const raw = await runTesseract(cropped, 'eng', true, logger);
-        const digits = raw.replace(/[^0-9\n]/g, '').trim();
-        results.push({ idx: i + 1, box: boxes[i], digits });
+
+      for (let i = 0; i < limited.length; i++) {
+        setStatus(`OCR中... 領域 ${i + 1} / ${limited.length}`);
+        await yieldToUI();
+        const cropped = cropAndEnhance(workCanvas, limited[i]);
+        const raw     = await ocrCanvas(worker, cropped);
+        const digits  = raw.replace(/[^0-9]/g, '');
+        results.push({ idx: i + 1, digits });
       }
 
-      // build output
-      const lines = results.filter(r => r.digits).map(r => `[${r.idx}] ${r.digits}`);
-      resultText.value = lines.join('\n') || '（認識できた数字なし）';
+      resultText.value = results.filter(r => r.digits).map(r => `[${r.idx}] ${r.digits}`).join('\n')
+                         || '（認識できた数字なし）';
 
-      // build region list
       regionsList.innerHTML = results.map(r =>
         `<div class="region-item">
           <span class="region-num">${r.idx}</span>
@@ -265,13 +275,18 @@ recognizeBtn.addEventListener('click', async () => {
       ).join('');
 
       setStatus('完了');
+
     } else {
-      // --- simple path ---
+      setStatus('Tesseract準備中...');
+      await yieldToUI();
+      const worker = await getWorker(lang, false);
       setStatus('認識中...');
-      const text = await runTesseract(canvas, lang, false, logger);
+      await yieldToUI();
+      const text = await ocrCanvas(worker, workCanvas);
       resultText.value = text;
       setStatus('完了');
     }
+
   } catch (err) {
     showError(err);
   } finally {
@@ -302,4 +317,9 @@ window.addEventListener('drop', e => {
   if (!f) return;
   fileInput.files = e.dataTransfer.files;
   fileInput.dispatchEvent(new Event('change'));
+});
+
+// cleanup worker on page unload
+window.addEventListener('beforeunload', () => {
+  if (sharedWorker) sharedWorker.terminate().catch(() => {});
 });
