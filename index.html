@@ -7,6 +7,8 @@
   <link rel="stylesheet" href="style.css">
   <!-- Tesseract.js CDN -->
   <script src="https://cdn.jsdelivr.net/npm/tesseract.js@4.0.2/dist/tesseract.min.js"></script>
+  <!-- OpenCV.js CDN -->
+  <script async src="https://docs.opencv.org/4.8.0/opencv.js" onload="window._cvReady=true"></script>
 </head>
 <body>
   <main>
@@ -20,7 +22,7 @@
 
     <label class="mode-label">
       <input id="num-only" type="checkbox" checked>
-      <strong>数字のみモード</strong>（認識対象を 0〜9 に限定し精度向上）
+      <strong>数字のみモード</strong>（OpenCV前処理 + 領域検出 + Tesseract）
     </label>
 
     <div id="error" class="error" style="display:none;margin-top:10px;color:#b00020;background:#fff0f0;padding:8px;border-radius:6px;border:1px solid #f1c0c0">
@@ -29,13 +31,17 @@
     </div>
 
     <canvas id="canvas" style="display:none"></canvas>
-    <div class="preview">
+
+    <!-- preview + overlay wrapper -->
+    <div class="preview-wrap">
       <img id="preview-img" alt="preview" style="display:none" />
+      <canvas id="overlay" style="display:none"></canvas>
     </div>
 
     <section class="result">
       <h2>認識結果</h2>
       <textarea id="result-text" rows="10" placeholder="ここに認識結果が表示されます..."></textarea>
+      <div id="regions-list"></div>
       <div class="actions">
         <button id="copy-btn">コピー</button>
         <select id="lang-select">
